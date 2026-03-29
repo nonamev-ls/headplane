@@ -114,9 +114,13 @@ jobs:
           OUT_PATH="$(readlink -f result)"
           popd
 
-          mkdir -p pkgroot/usr/bin pkgroot/usr/share/headplane
+          mkdir -p pkgroot/usr/bin pkgroot/usr/share/headplane pkgroot/etc/headplane pkgroot/usr/lib/systemd/system rpm-scripts
           cp -r "${OUT_PATH}/share/headplane/." pkgroot/usr/share/headplane/
           chmod -R u+rwX,go+rX pkgroot/usr/share/headplane
+
+          cp upstream-headplane/config.example.yaml pkgroot/etc/headplane/config.example.yaml
+          cp upstream-headplane/config.example.yaml pkgroot/etc/headplane/config.yaml
+          chmod 0644 pkgroot/etc/headplane/config.example.yaml pkgroot/etc/headplane/config.yaml
 
           cat > pkgroot/usr/bin/headplane <<'EOF'
           #!/usr/bin/env bash
@@ -126,25 +130,65 @@ jobs:
           EOF
           chmod 0755 pkgroot/usr/bin/headplane
 
-      - name: Build RPM artifact
+          cat > pkgroot/usr/lib/systemd/system/headplane.service <<'EOF'
+          [Unit]
+          Description=Headplane Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/usr/share/headplane
+          ExecStart=/usr/bin/headplane
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          chmod 0644 pkgroot/usr/lib/systemd/system/headplane.service
+
+          cat > rpm-scripts/post-install.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+          fi
+          EOF
+
+          cat > rpm-scripts/post-remove.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+          fi
+          EOF
+          chmod 0755 rpm-scripts/post-install.sh rpm-scripts/post-remove.sh
+
+      - name: Build RPM artifacts (x86_64 + aarch64)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          fpm \
-            -s dir \
-            -t rpm \
-            -n headplane \
-            -v "${HEADPLANE_VERSION}" \
-            --iteration 1 \
-            --architecture x86_64 \
-            --license MIT \
-            --url "https://github.com/${UPSTREAM_REPO}" \
-            --description "Headplane (built from ${HEADPLANE_TAG} via Nix flake)." \
-            --depends "nodejs >= 22" \
-            --package "dist/headplane-${HEADPLANE_VERSION}-1.x86_64.rpm" \
-            -C pkgroot \
-            .
+          for ARCH in x86_64 aarch64; do
+            fpm \
+              -s dir \
+              -t rpm \
+              -n headplane \
+              -v "${HEADPLANE_VERSION}" \
+              --iteration 1 \
+              --architecture "${ARCH}" \
+              --license MIT \
+              --url "https://github.com/${UPSTREAM_REPO}" \
+              --description "Headplane (built from ${HEADPLANE_TAG} via Nix flake)." \
+              --depends "nodejs >= 22" \
+              --config-files /etc/headplane/config.yaml \
+              --config-files /etc/headplane/config.example.yaml \
+              --after-install rpm-scripts/post-install.sh \
+              --after-remove rpm-scripts/post-remove.sh \
+              --package "dist/headplane-${HEADPLANE_VERSION}-1.${ARCH}.rpm" \
+              -C pkgroot \
+              .
+          done
           sha256sum dist/*.rpm > dist/SHA256SUMS
 
       - name: Upload build artifacts
@@ -164,4 +208,7 @@ jobs:
           replacesArtifacts: true
           artifactErrorsFailBuild: true
           generateReleaseNotes: true
+
+
+
 
