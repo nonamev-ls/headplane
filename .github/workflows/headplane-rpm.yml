@@ -115,7 +115,8 @@ jobs:
           popd
 
           mkdir -p pkgroot/usr/bin pkgroot/usr/share/headplane
-          cp -a "${OUT_PATH}/share/headplane/." pkgroot/usr/share/headplane/
+          cp -r "${OUT_PATH}/share/headplane/." pkgroot/usr/share/headplane/
+          chmod -R u+rwX,go+rX pkgroot/usr/share/headplane
 
           cat > pkgroot/usr/bin/headplane <<'EOF'
           #!/usr/bin/env bash
@@ -163,3 +164,4 @@ jobs:
           replacesArtifacts: true
           artifactErrorsFailBuild: true
           generateReleaseNotes: true
+
