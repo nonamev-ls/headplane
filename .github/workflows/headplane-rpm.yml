@@ -1,0 +1,165 @@
+name: Build Headplane RPM
+
+on:
+  workflow_dispatch:
+    inputs:
+      headplane_tag:
+        description: "Upstream tag to build (for example: v0.6.2). Leave empty to use latest."
+        required: false
+        type: string
+      force:
+        description: "Build even if this tag already has a release in this repository."
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "35 */6 * * *"
+  repository_dispatch:
+    types:
+      - headplane-upstream-release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: headplane-rpm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve Upstream Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve target tag
+        id: resolve
+        env:
+          INPUT_TAG: ${{ github.event.inputs.headplane_tag }}
+          FORCE_BUILD: ${{ github.event.inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="$(git ls-remote --refs --tags https://github.com/tale/headplane.git 'v*' \
+              | awk -F/ '{print $3}' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1)"
+          fi
+
+          if [[ -z "${TAG}" ]]; then
+            echo "Unable to determine upstream tag." >&2
+            exit 1
+          fi
+
+          if ! git ls-remote --refs --tags https://github.com/tale/headplane.git "refs/tags/${TAG}" | grep -q .; then
+            echo "Upstream tag '${TAG}' does not exist." >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${FORCE_BUILD:-false}" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists in ${GITHUB_REPOSITORY}, skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build RPM (${{ needs.resolve.outputs.tag }})
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      HEADPLANE_TAG: ${{ needs.resolve.outputs.tag }}
+      HEADPLANE_VERSION: ${{ needs.resolve.outputs.version }}
+      UPSTREAM_REPO: tale/headplane
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v19
+
+      - name: Install RPM packager dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+
+      - name: Build headplane with Nix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${HEADPLANE_TAG}" "https://github.com/${UPSTREAM_REPO}.git" upstream-headplane
+          pushd upstream-headplane
+          nix build .#headplane --accept-flake-config --print-build-logs
+          OUT_PATH="$(readlink -f result)"
+          popd
+
+          mkdir -p pkgroot/usr/bin pkgroot/usr/share/headplane
+          cp -a "${OUT_PATH}/share/headplane/." pkgroot/usr/share/headplane/
+
+          cat > pkgroot/usr/bin/headplane <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd /usr/share/headplane
+          exec /usr/bin/node /usr/share/headplane/build/server/index.js "$@"
+          EOF
+          chmod 0755 pkgroot/usr/bin/headplane
+
+      - name: Build RPM artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          fpm \
+            -s dir \
+            -t rpm \
+            -n headplane \
+            -v "${HEADPLANE_VERSION}" \
+            --iteration 1 \
+            --architecture x86_64 \
+            --license MIT \
+            --url "https://github.com/${UPSTREAM_REPO}" \
+            --description "Headplane (built from ${HEADPLANE_TAG} via Nix flake)." \
+            --depends "nodejs >= 22" \
+            --package "dist/headplane-${HEADPLANE_VERSION}-1.x86_64.rpm" \
+            -C pkgroot \
+            .
+          sha256sum dist/*.rpm > dist/SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: headplane-rpm-${{ env.HEADPLANE_TAG }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.HEADPLANE_TAG }}
+          name: Headplane ${{ env.HEADPLANE_TAG }} RPM
+          artifacts: dist/*
+          allowUpdates: true
+          replacesArtifacts: true
+          artifactErrorsFailBuild: true
+          generateReleaseNotes: true
